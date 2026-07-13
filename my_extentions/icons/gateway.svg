@@ -1,0 +1,26 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="16" x2="76" y2="80" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <radialGradient id="portal" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(48 48) rotate(90) scale(28)">
+      <stop stop-color="#A7F3D0"/>
+      <stop offset="0.45" stop-color="#22D3EE"/>
+      <stop offset="0.78" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="28" y1="24" x2="70" y2="73" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67E8F9"/>
+      <stop offset="0.5" stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#34D399"/>
+    </linearGradient>
+  </defs>
+  <circle cx="48" cy="48" r="46" fill="url(#bg)"/>
+  <circle cx="48" cy="48" r="26" fill="url(#portal)"/>
+  <circle cx="48" cy="48" r="33" stroke="url(#ring)" stroke-width="6"/>
+  <circle cx="48" cy="48" r="38" stroke="#93C5FD" stroke-opacity="0.18" stroke-width="2" stroke-dasharray="4 6"/>
+  <path d="M48 25L51.4 34.6L61 38L51.4 41.4L48 51L44.6 41.4L35 38L44.6 34.6L48 25Z" fill="#F8FAFC"/>
+  <path d="M67 58L68.8 63.2L74 65L68.8 66.8L67 72L65.2 66.8L60 65L65.2 63.2L67 58Z" fill="#CFFAFE" fill-opacity="0.95"/>
+  <path d="M29 56L30.2 59.8L34 61L30.2 62.2L29 66L27.8 62.2L24 61L27.8 59.8L29 56Z" fill="#A5F3FC" fill-opacity="0.9"/>
+</svg>

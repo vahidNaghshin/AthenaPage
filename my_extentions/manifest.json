@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Ask This Page",
+  "version": "1.0",
+  "description": "Chat with any webpage using AI",
+
+  "permissions": [
+    "activeTab"
+  ],
+
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/bot.png", "icons/gateway.svg"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+
+  "icons": {
+    "48": "icons/bot.png"
+  }
+}

@@ -1,0 +1,128 @@
+/* Floating trigger button */
+#ask-page-btn {
+  position: fixed;
+  bottom: 32px;
+  right: 32px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: #2563eb;
+  color: white;
+  font-size: 26px;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  z-index: 2147483646;       /* just below the panel */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s, background 0.2s;
+  overflow: hidden;
+}
+
+#ask-page-btn:hover {
+  transform: scale(1.1);
+  background: #1d4ed8;
+}
+
+#ask-page-btn img {
+  width: 38px;
+  height: 38px;
+  object-fit: contain;
+  pointer-events: none;
+  filter: drop-shadow(0 0 10px rgba(103, 232, 249, 0.35));
+}
+
+#ask-page-btn.open {
+  font-size: 32px;
+}
+
+#ask-page-btn.open::before {
+  content: "✕";
+  color: white;
+  line-height: 1;
+}
+
+#ask-page-btn.open img {
+  display: none;
+}
+
+/* The sliding chat panel */
+#chainlit-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: var(--chainlit-panel-width, 420px);
+  height: 100vh;
+  background: white;
+  border-left: 1px solid #e5e7eb;
+  box-shadow: -4px 0 24px rgba(0,0,0,0.12);
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+
+  /* Start hidden off-screen, slide in when .open */
+  transform: translateX(100%);
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+#chainlit-resize-handle {
+  position: absolute;
+  left: -4px;
+  top: 0;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1;
+}
+
+#chainlit-resize-handle:hover {
+  background: rgba(37, 99, 235, 0.15);
+}
+
+body.chainlit-resizing,
+body.chainlit-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+#chainlit-panel.open {
+  transform: translateX(0);
+}
+
+/* Panel header */
+#chainlit-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #2563eb;
+  color: white;
+  font-family: sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+#chainlit-panel-header button {
+  background: none;
+  border: none;
+  color: white;
+  font-size: 20px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+/* The iframe that loads Chainlit */
+#chainlit-iframe {
+  flex: 1;
+  border: none;
+  width: 100%;
+}
+
+/* Push page content left when panel is open */
+body.chainlit-panel-open {
+  margin-right: var(--chainlit-panel-width, 420px) !important;
+  transition: margin-right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
