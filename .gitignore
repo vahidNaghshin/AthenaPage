@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+test.py
 
 # Virtual environments
 .venv/
@@ -24,3 +25,4 @@ env/
 
 # Logs
 *.log
+

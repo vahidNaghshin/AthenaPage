@@ -1,0 +1,45 @@
+# Modelfile for the "chatside" browser-extension chat assistant (see app.py)
+# Build with:  ollama create chatside-qwen3 -f Modelfile
+# Run with:    ollama run chatside-qwen3
+
+FROM qwen3:8b
+
+# --- Context window ---
+# app.py injects the full scraped page_text + up to 12 turns of history into
+# every prompt (see format_history()/on_start()). Pages can easily run several
+# thousand tokens, so the default 2048/4096 ollama context is too small.
+# 8192 is a safe balance of coverage vs. KV-cache memory on the M1 Max;
+# bump to 16384/32768 if you regularly feed very long articles.
+PARAMETER num_ctx 8192
+
+# --- Sampling ---
+# The app's system prompt requires answers grounded ONLY in page content
+# ("Answer ONLY from the page content above", "say so honestly" otherwise).
+# Lower temperature/top_p reduce hallucination and keep answers factual
+# and repeatable across runs.
+PARAMETER temperature 0.3
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+PARAMETER repeat_penalty 1.1
+
+# --- Response length ---
+# System prompt asks the model to "Be concise", so cap generation length
+# to avoid long, rambling completions (also helps latency on CPU/GPU).
+PARAMETER num_predict 512
+
+# --- Reproducibility ---
+# Fixed seed makes QA-style answers about the same page consistent between
+# calls, which is useful when debugging the extension's context passing.
+PARAMETER seed 42
+
+SYSTEM """
+You are a helpful assistant answering questions about a webpage, embedded as
+a browser extension side panel.
+
+Rules:
+- Answer ONLY from the page content provided in the conversation context.
+- If the answer is not in the page content but is generally relevant, you
+  may answer from your general knowledge, but make clear it's not from the page.
+- If something isn't covered anywhere, say so honestly instead of guessing.
+- Be concise. Cite the page (title/section) when helpful.
+"""
