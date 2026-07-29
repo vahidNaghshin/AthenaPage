@@ -1,28 +1,35 @@
-# ChatSide: Browser Extension Chat Assistant
+# ChatSide: Browser Extension Chat Assistant with RAG
 
-A Chainlit-powered browser extension that answers questions about any webpage using a local Ollama LLM.
+A Chainlit-powered browser extension that answers questions about any webpage
+using a local Ollama LLM, and now persists pages to a PostgreSQL vector store
+so they can be retrieved semantically across sessions.
 
 ## Features
 
-- **Local-first**: Runs entirely on your machine using Ollama
+- **Local-first**: Runs entirely on your machine using Ollama and PostgreSQL
 - **Browser integrated**: Chrome extension adds a chat panel to any webpage
 - **Context-aware**: Automatically captures and analyzes page content
+- **RAG pipeline**: Saved pages are chunked, embedded, and stored in pgvector for semantic retrieval
+- **Persistent memory**: Add or delete any page from the knowledge base with in-chat buttons
 - **Privacy-focused**: No data sent to external APIs
 
 ## Architecture
 
-- `app.py`: Chainlit backend with Ollama integration
+- `app.py`: Chainlit backend — chat, RAG save/delete, and action buttons
+- `models.py`: SQLAlchemy ORM models for `webpages` and `chunks` tables
 - `my_extensions/`: Chrome extension (manifest, content script, styling)
 - `Modelfile`: Custom Ollama model configuration for optimal QA performance
-- `chainlit.md`: Welcome message and documentation
-- `run_chainlit.sh`: One-command startup script
+- `chainlit.md`: Welcome message
+- `run_chainlit.sh`: One-command startup script (starts Postgres, Ollama, and Chainlit)
 
 ## Prerequisites
 
 - **Python**: 3.9+ (tested on 3.9, 3.11)
 - **Ollama**: Installed and runnable (download from [ollama.ai](https://ollama.ai))
+- **PostgreSQL 18**: Installed via Homebrew (`brew install postgresql@18`)
+- **pgvector extension**: Installed via Homebrew (`brew install pgvector`)
 - **Chrome/Chromium**: For the browser extension
-- **4GB+ RAM**: For running qwen3:8b model
+- **8GB+ RAM**: For running qwen3:8b model plus Postgres
 
 ## Quick Start
 
@@ -30,7 +37,7 @@ A Chainlit-powered browser extension that answers questions about any webpage us
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 ```
 
 ### 2. Install Dependencies
@@ -39,9 +46,17 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirement.txt
 ```
 
-### 3. Create Ollama Model (Optional but Recommended)
+### 3. Install and Start PostgreSQL (macOS)
 
-This creates an optimized model with custom parameters:
+```bash
+brew install postgresql@18 pgvector
+brew services start postgresql@18
+```
+
+The startup script handles creating the `postgres` role, `page_embeddings`
+database, and enabling the `vector` extension automatically on first run.
+
+### 4. Create Ollama Model (Optional but Recommended)
 
 ```bash
 ollama create chatside-qwen3 -f Modelfile
@@ -49,7 +64,7 @@ ollama create chatside-qwen3 -f Modelfile
 
 If you skip this, the app falls back to `qwen3:8b`.
 
-### 4. Run the App
+### 5. Run the App
 
 **Easiest way** (automated setup):
 
@@ -59,23 +74,31 @@ chmod +x run_chainlit.sh
 ```
 
 This script automatically:
-- Activates the venv
-- Starts Ollama server
+- Starts the Homebrew PostgreSQL service
+- Creates the `postgres` role and `page_embeddings` database if missing
+- Enables the `pgvector` extension
+- Runs `models.py` to create the `webpages` and `chunks` tables
+- Starts the Ollama server
 - Pulls required models (`chatside-qwen3`, `mxbai-embed-large`)
 - Launches Chainlit on `http://localhost:8000`
 
 **Manual way**:
 
 ```bash
-# Terminal 1: Start Ollama
+# Terminal 1: Start Postgres
+brew services start postgresql@18
+
+# Terminal 2: Start Ollama
 ollama serve
 
-# Terminal 2: Run Chainlit
+# Terminal 3: Run Chainlit
 source .venv/bin/activate
-python -u -m chainlit run app.py
+export DATABASE_URL=postgresql://postgres:postgres@localhost/page_embeddings
+python models.py            # create tables on first run
+python -u -m chainlit run app.py -h
 ```
 
-### 5. Load the Chrome Extension
+### 6. Load the Chrome Extension
 
 1. Open Chrome → `chrome://extensions`
 2. Enable "Developer mode" (top right)
@@ -83,53 +106,104 @@ python -u -m chainlit run app.py
 4. Select the `my_extensions` folder
 5. Visit any webpage and click the **Ask This Page** button
 
+## RAG Pipeline
+
+### Saving a Page
+
+Click the **Add** button that appears on any chat message to store the current
+page in the knowledge base. The pipeline:
+
+1. Generates a 2–3 sentence LLM summary using `chatside-qwen3`
+2. Splits the raw page text into chunks of **800 tokens** with **100-token overlap**
+   using LangChain's `RecursiveCharacterTextSplitter`
+3. Generates a **1536-dimensional embedding** per chunk using `mxbai-embed-large`
+   (1024-dim output zero-padded to 1536 to match the schema)
+4. Inserts/updates one row in `webpages` and replaces all rows in `chunks`
+5. Re-saving the same URL updates the existing row instead of failing
+
+### Deleting a Page
+
+Click the **Delete** button to remove the current page and all its chunks from
+the database (cascaded).
+
+### Database Schema
+
+```
+webpages
+  id              UUID  PRIMARY KEY
+  url             TEXT  UNIQUE NOT NULL
+  title           TEXT
+  description     TEXT
+  author          TEXT
+  language        TEXT
+  domain          TEXT
+  raw_content     TEXT
+  llm_summary     TEXT
+  word_count      INTEGER
+  is_chunked      BOOLEAN
+  status          TEXT  (pending | processed | failed)
+  created_at      TIMESTAMPTZ
+  updated_at      TIMESTAMPTZ
+  last_visited_at TIMESTAMPTZ
+
+chunks
+  id              UUID  PRIMARY KEY
+  webpage_id      UUID  FK → webpages(id) ON DELETE CASCADE
+  chunk_index     INTEGER
+  content         TEXT
+  embedding       vector(1536)
+  token_count     INTEGER
+  chunk_type      TEXT  (content | summary | raw | heading)
+  created_at      TIMESTAMPTZ
+```
+
 ## How It Works
 
 ```
-Browser Extension          Chainlit Backend       Ollama
-   |                            |                  |
-   +---POST /ext/context-----→  |                  |
-   |  (page URL, title, text)    |                  |
-   |                            |--pulls model---→ |
-   |  ←---chat response------  |  |  qwen3:8b     |
-   |     (grounded in page)     |  |               |
-   +                            |←-- embeddings --+
+Browser Extension        Chainlit Backend            PostgreSQL / Ollama
+   |                          |                             |
+   +--POST /ext/context----→  |                             |
+   |  (url, title, text)       |                             |
+   |                          |---chat (qwen3:8b)----------→|
+   |  ←--chat response------  |                             |
+   |                          |                             |
+   | [Add button click]        |                             |
+   +--action: add----------→  |--summarise (qwen3:8b)-----→|
+                               |--chunk + embed (mxbai)----→|
+                               |--upsert webpages/chunks---→|
+   | [Delete button click]     |                             |
+   +--action: delete-------→  |--DELETE webpages row------→|
 ```
-
-1. Extension captures visible page text
-2. POSTs context to `/ext/context` endpoint
-3. Chainlit initializes LLM chain with page context
-4. User questions are answered using the captured page content
-5. Embedding model used for semantic search (optional)
 
 ## Models
 
-### Chat Model: `qwen3:8b`
-- 8B parameter language model
-- Quantized to 4-bit (Q4_K) for efficiency
+### Chat Model: `chatside-qwen3` (based on `qwen3:8b`)
+- 8B parameter language model, custom context window (8192 tokens)
+- Temperature 0.3 for factual, page-grounded answers
 - ~5GB memory footprint
-- Fast inference on M1 Max (8-12 tokens/sec)
 
 ### Embedding Model: `mxbai-embed-large`
-- Used for optional semantic search
-- 1024-dimension embeddings
+- Used for chunk embeddings stored in pgvector
+- 1024-dimension output (zero-padded to 1536 in the DB schema)
 - ~300MB footprint
 
 ## Environment Variables
 
-The app loads `.env` from:
-- Project root
-- App directory
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost/page_embeddings` | SQLAlchemy-compatible Postgres URL |
 
-No AWS credentials needed—everything runs locally!
+The app also loads `.env` from the project root and app directory if present.
 
 ## File Structure
 
 ```
 chatside/
-├── app.py                 # Chainlit backend
-├── Modelfile              # Ollama model config
-├── run_chainlit.sh        # Startup script
+├── app.py                 # Chainlit backend + RAG save/delete pipeline
+├── models.py              # SQLAlchemy ORM (webpages + chunks)
+├── Modelfile              # Ollama model config (chatside-qwen3)
+├── run_chainlit.sh        # Startup script (Postgres + Ollama + Chainlit)
+├── install_postgres_macos.sh  # One-time Homebrew Postgres setup
 ├── requirement.txt        # Python dependencies
 ├── README.md              # This file
 ├── chainlit.md            # Welcome message
@@ -143,20 +217,27 @@ chatside/
 
 ## Troubleshooting
 
+### PostgreSQL connection error (`role "postgres" does not exist`)
+
+The `run_chainlit.sh` script creates the `postgres` role automatically. If
+running manually, provision it once:
+
+```bash
+psql -d postgres -c "CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres';"
+psql -d postgres -c "CREATE DATABASE page_embeddings OWNER postgres;"
+psql -d page_embeddings -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
 ### Ollama not starting
 
 ```bash
-# Check if ollama is installed
 which ollama
-
-# Start manually
 ollama serve
 ```
 
 ### Models won't pull
 
 ```bash
-# Pull manually
 ollama pull qwen3:8b
 ollama pull mxbai-embed-large
 ```
@@ -177,11 +258,12 @@ ollama pull mxbai-embed-large
 
 **M1 Max (16GB)**:
 - ~15 seconds first request (model loads)
-- ~8-12 tokens/second sustained
-- Suitable for interactive Q&A
+- ~8–12 tokens/second chat generation
+- Embedding generation: ~100ms per chunk (mxbai-embed-large)
+- Suitable for interactive Q&A and page ingestion
 
 **GPU acceleration**:
-- Metal GPU on macOS: Automatic
+- Metal GPU on macOS: Automatic via Ollama
 - NVIDIA: Ensure CUDA drivers installed
 - AMD: Use ROCm backend
 
@@ -189,7 +271,7 @@ ollama pull mxbai-embed-large
 
 The app is model-agnostic. To use a different LLM:
 
-1. Update `app.py` line 135:
+1. Update `app.py`:
    ```python
    llm = ChatOllama(model="your-model-name")
    ```
