@@ -2,14 +2,21 @@ import chainlit as cl
 from urllib.parse import unquote, urlparse, parse_qs
 from contextvars import ContextVar
 import importlib
+import functools
 from fastapi import Body
 from chainlit.server import app as chainlit_app
 from pathlib import Path
+import uuid
+from datetime import datetime
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
+from chainlit.action import Action as ChainlitAction
+
+from models import Webpage, Chunk, get_db_session
 
 
 # Load .env from both workspace root and app directory if present.
@@ -22,11 +29,26 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 cl_context_module = importlib.import_module("chainlit.context")
 cl_step_module = importlib.import_module("chainlit.step")
 cl_message_module = importlib.import_module("chainlit.message")
+cl_socket_module = importlib.import_module("chainlit.socket")
 
 patched_local_steps = ContextVar("local_steps", default=None)
 cl_context_module.local_steps = patched_local_steps
 cl_step_module.local_steps = patched_local_steps
 cl_message_module.local_steps = patched_local_steps
+
+
+original_connect_handler = cl_socket_module.sio.handlers["/"]["connect"]
+
+
+@functools.wraps(original_connect_handler)
+async def patched_connect_handler(sid, environ, auth=None):
+    normalized_auth = auth or {}
+    normalized_auth.setdefault("sessionId", str(uuid.uuid4()))
+    normalized_auth.setdefault("clientType", "webapp")
+    return await original_connect_handler(sid, environ, normalized_auth)
+
+
+cl_socket_module.sio.handlers["/"]["connect"] = patched_connect_handler
 
 
 # Global context for page data from browser extension
@@ -62,6 +84,15 @@ def normalize_str(value, default="") -> str:
     return str(value).strip() or default if value else default
 
 
+def normalize_page_url(value: str) -> str:
+    """Extract the raw URL if the value arrives as a markdown link."""
+    normalized = normalize_str(value)
+    if normalized.startswith("[") and "](" in normalized and normalized.endswith(")"):
+        _, link_target = normalized.split("](", 1)
+        return link_target[:-1].strip()
+    return normalized
+
+
 def format_history(history: list) -> str:
     """Format last 12 turns of conversation history."""
     lines = []
@@ -71,6 +102,138 @@ def format_history(history: list) -> str:
         if content:
             lines.append(f"{role}: {content}")
     return "\n".join(lines)
+
+
+async def send_message_actions(message_id: str) -> None:
+    """Attach add/delete actions to an existing message."""
+    actions = [
+        ChainlitAction("add", {"action": "add"}, "Add", "Save webpage to database"),
+        ChainlitAction("delete", {"action": "delete"}, "Delete", "Delete webpage from database"),
+    ]
+    for action in actions:
+        await action.send(for_id=message_id)
+
+
+async def chunk_content(text: str, chunk_size: int = 800, overlap: int = 100) -> list[dict]:
+    """Split content into chunks using LangChain with token-based splitting."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    chunks = splitter.split_text(text)
+    return [{"content": chunk, "index": i} for i, chunk in enumerate(chunks)]
+
+
+async def generate_embeddings(text: str) -> list:
+    """Generate embeddings using Ollama embedding model compatible with qwen3."""
+    try:
+        embeddings_model = OllamaEmbeddings(model="mxbai-embed-large")
+        embedding = await embeddings_model.aembed_query(text)
+        # Pad to 1536 if necessary (mxbai-embed-large produces 1024)
+        if len(embedding) < 1536:
+            embedding = embedding + [0.0] * (1536 - len(embedding))
+        return embedding[:1536]
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return [0.0] * 1536
+
+
+async def generate_summary(text: str, title: str, llm_chain) -> str:
+    """Generate summary of webpage content using the LLM."""
+    try:
+        summary_prompt = f"""Summarize the following webpage content in 2-3 sentences.
+Title: {title}
+Content:
+{text[:2000]}...
+
+Summary:"""
+        summary = await llm_chain.ainvoke(
+            {
+                "input": summary_prompt,
+                "history": "",
+                "system_prompt": "You are a helpful summarizer. Provide concise summaries.",
+            }
+        )
+        return summary.strip()
+    except Exception as e:
+        print(f"Error generating summary: {e}")
+        return "Summary generation failed"
+
+
+async def save_webpage_to_db(
+    url: str, title: str, content: str, summary: str, page_context: dict
+) -> str:
+    """Save webpage and chunks to database with embeddings."""
+    session = get_db_session()
+    try:
+        normalized_url = normalize_page_url(url)
+        webpage = session.query(Webpage).filter(Webpage.url == normalized_url).first()
+
+        if webpage is None:
+            webpage = Webpage(url=normalized_url)
+            session.add(webpage)
+            session.flush()
+
+        webpage.title = title
+        webpage.description = page_context.get("description", "")
+        webpage.author = page_context.get("author")
+        webpage.language = page_context.get("language")
+        webpage.domain = page_context.get("domain")
+        webpage.favicon_url = page_context.get("favicon_url")
+        webpage.screenshot_url = page_context.get("screenshot_url")
+        webpage.raw_content = content
+        webpage.llm_summary = summary
+        webpage.word_count = len(content.split())
+        webpage.status = "processed"
+        webpage.last_visited_at = datetime.utcnow()
+
+        session.query(Chunk).filter(Chunk.webpage_id == webpage.id).delete(
+            synchronize_session=False
+        )
+        
+        # Generate chunks
+        chunks_data = await chunk_content(content, chunk_size=800, overlap=100)
+        
+        # Create chunk records with embeddings
+        for chunk_info in chunks_data:
+            embedding = await generate_embeddings(chunk_info["content"])
+            chunk = Chunk(
+                webpage_id=webpage.id,
+                chunk_index=chunk_info["index"],
+                content=chunk_info["content"],
+                embedding=embedding,
+                token_count=len(chunk_info["content"].split()),
+                chunk_type="content",
+            )
+            session.add(chunk)
+        
+        webpage.is_chunked = True
+        session.commit()
+        return str(webpage.id)
+    except Exception as e:
+        session.rollback()
+        print(f"Error saving webpage: {e}")
+        raise
+    finally:
+        session.close()
+
+
+async def delete_webpage_from_db(webpage_id: str) -> bool:
+    """Delete webpage and associated chunks from database."""
+    try:
+        session = get_db_session()
+        webpage = session.query(Webpage).filter(Webpage.id == webpage_id).first()
+        if webpage:
+            session.delete(webpage)
+            session.commit()
+            session.close()
+            return True
+        session.close()
+        return False
+    except Exception as e:
+        print(f"Error deleting webpage: {e}")
+        return False
 
 
 @chainlit_app.post("/ext/context")
@@ -109,6 +272,11 @@ async def on_start():
     print(f"Page URL: {page_url}")
     print(f"Page Title: {page_title}")
     print(f"Page Text Length: {len(page_text)}")
+    
+    # Store page context in session for database operations
+    cl.user_session.set("page_url", page_url)
+    cl.user_session.set("page_title", page_title)
+    cl.user_session.set("page_text", page_text)
 
     if not page_text:
         await cl.Message(content="⚠️ No page content received.").send()
@@ -150,9 +318,11 @@ User question:
     cl.user_session.set("llm_chain", chain)
 
     print("Chat session initialized successfully.")
-    await cl.Message(
+    
+    welcome_message = await cl.Message(
         content=f"✅ **{page_title}** loaded!\n\nAsk me anything about this page."
     ).send()
+    await send_message_actions(welcome_message.id)
 
 
 @cl.on_message
@@ -160,6 +330,9 @@ async def on_message(message: cl.Message):
     """Process user message and generate response."""
     system_prompt = cl.user_session.get("system_prompt", "")
     history = cl.user_session.get("history", [])
+    page_url = cl.user_session.get("page_url", "Unknown")
+    page_title = cl.user_session.get("page_title", "Unknown")
+    page_text = cl.user_session.get("page_text", "")
 
     # Add user message to history
     history.append({"role": "user", "content": message.content})
@@ -176,6 +349,9 @@ async def on_message(message: cl.Message):
 
     # Generate response
     text = await llm_chain.ainvoke(
+
+
+        \
         {
             "input": message.content,
             "history": history_text,
@@ -187,4 +363,73 @@ async def on_message(message: cl.Message):
     history.append({"role": "assistant", "content": text})
     cl.user_session.set("history", history)
 
-    await cl.Message(content=text).send()
+    response_message = await cl.Message(content=text).send()
+    await send_message_actions(response_message.id)
+
+
+@cl.action_callback("add")
+async def handle_add_webpage(action: cl.Action):
+    """Handle adding webpage to database."""
+    try:
+        page_url = cl.user_session.get("page_url", "Unknown")
+        page_title = cl.user_session.get("page_title", "Unknown")
+        page_text = cl.user_session.get("page_text", "")
+        llm_chain = cl.user_session.get("llm_chain")
+        
+        if not page_text:
+            await cl.Message(content="❌ No page content available to save.").send()
+            return
+        
+        # Show progress
+        await cl.Message(content="⏳ Generating summary...").send()
+        summary = await generate_summary(page_text, page_title, llm_chain)
+        
+        await cl.Message(content="⏳ Chunking content and generating embeddings...").send()
+        webpage_id = await save_webpage_to_db(
+            url=page_url,
+            title=page_title,
+            content=page_text,
+            summary=summary,
+            page_context={"description": ""},
+        )
+        
+        # Store webpage_id in session for potential delete operation
+        cl.user_session.set("last_webpage_id", webpage_id)
+        
+        await cl.Message(
+            content=f"✅ **Webpage saved successfully!**\n\n**Summary:** {summary}\n\n**ID:** {webpage_id}"
+        ).send()
+    except Exception as e:
+        await cl.Message(
+            content=f"❌ Error saving webpage: {str(e)}"
+        ).send()
+
+
+@cl.action_callback("delete")
+async def handle_delete_webpage(action: cl.Action):
+    """Handle deleting webpage from database."""
+    try:
+        webpage_id = cl.user_session.get("last_webpage_id")
+        
+        if not webpage_id:
+            await cl.Message(
+                content="❌ No webpage to delete. Save a webpage first using the 'add' button."
+            ).send()
+            return
+        
+        await cl.Message(content="⏳ Deleting webpage...").send()
+        success = await delete_webpage_from_db(webpage_id)
+        
+        if success:
+            cl.user_session.set("last_webpage_id", None)
+            await cl.Message(
+                content=f"✅ **Webpage deleted successfully!** (ID: {webpage_id})"
+            ).send()
+        else:
+            await cl.Message(
+                content=f"❌ Webpage not found or already deleted (ID: {webpage_id})"
+            ).send()
+    except Exception as e:
+        await cl.Message(
+            content=f"❌ Error deleting webpage: {str(e)}"
+        ).send()
