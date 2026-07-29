@@ -108,13 +108,17 @@ async def send_message_actions(message_id: str) -> None:
     """Attach add/delete actions to an existing message."""
     actions = [
         ChainlitAction("add", {"action": "add"}, "Add", "Save webpage to database"),
-        ChainlitAction("delete", {"action": "delete"}, "Delete", "Delete webpage from database"),
+        ChainlitAction(
+            "delete", {"action": "delete"}, "Delete", "Delete webpage from database"
+        ),
     ]
     for action in actions:
         await action.send(for_id=message_id)
 
 
-async def chunk_content(text: str, chunk_size: int = 800, overlap: int = 100) -> list[dict]:
+async def chunk_content(
+    text: str, chunk_size: int = 800, overlap: int = 100
+) -> list[dict]:
     """Split content into chunks using LangChain with token-based splitting."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -191,10 +195,10 @@ async def save_webpage_to_db(
         session.query(Chunk).filter(Chunk.webpage_id == webpage.id).delete(
             synchronize_session=False
         )
-        
+
         # Generate chunks
         chunks_data = await chunk_content(content, chunk_size=800, overlap=100)
-        
+
         # Create chunk records with embeddings
         for chunk_info in chunks_data:
             embedding = await generate_embeddings(chunk_info["content"])
@@ -207,7 +211,7 @@ async def save_webpage_to_db(
                 chunk_type="content",
             )
             session.add(chunk)
-        
+
         webpage.is_chunked = True
         session.commit()
         return str(webpage.id)
@@ -244,7 +248,7 @@ async def set_ext_context(payload: dict = Body(default_factory=dict)):
         payload.get("page_title"), "Unknown"
     )
     LAST_PAGE_CONTEXT["page_text"] = normalize_str(payload.get("page_text"), "")
-    
+
     return {
         "ok": True,
         "page_text_length": len(LAST_PAGE_CONTEXT["page_text"]),
@@ -272,7 +276,7 @@ async def on_start():
     print(f"Page URL: {page_url}")
     print(f"Page Title: {page_title}")
     print(f"Page Text Length: {len(page_text)}")
-    
+
     # Store page context in session for database operations
     cl.user_session.set("page_url", page_url)
     cl.user_session.set("page_title", page_title)
@@ -299,7 +303,7 @@ Rules:
 - If something isn't covered, say so honestly
 - Be concise. Cite the page when helpful.
 """
-    
+
     cl.user_session.set("system_prompt", system_prompt)
 
     # Initialize Ollama LLM with prompt template and chain
@@ -313,12 +317,12 @@ Conversation so far:
 User question:
 {input}"""
     )
-    
+
     chain = prompt | llm | StrOutputParser()
     cl.user_session.set("llm_chain", chain)
 
     print("Chat session initialized successfully.")
-    
+
     welcome_message = await cl.Message(
         content=f"✅ **{page_title}** loaded!\n\nAsk me anything about this page."
     ).send()
@@ -349,9 +353,6 @@ async def on_message(message: cl.Message):
 
     # Generate response
     text = await llm_chain.ainvoke(
-
-
-        \
         {
             "input": message.content,
             "history": history_text,
@@ -375,16 +376,18 @@ async def handle_add_webpage(action: cl.Action):
         page_title = cl.user_session.get("page_title", "Unknown")
         page_text = cl.user_session.get("page_text", "")
         llm_chain = cl.user_session.get("llm_chain")
-        
+
         if not page_text:
             await cl.Message(content="❌ No page content available to save.").send()
             return
-        
+
         # Show progress
         await cl.Message(content="⏳ Generating summary...").send()
         summary = await generate_summary(page_text, page_title, llm_chain)
-        
-        await cl.Message(content="⏳ Chunking content and generating embeddings...").send()
+
+        await cl.Message(
+            content="⏳ Chunking content and generating embeddings..."
+        ).send()
         webpage_id = await save_webpage_to_db(
             url=page_url,
             title=page_title,
@@ -392,17 +395,15 @@ async def handle_add_webpage(action: cl.Action):
             summary=summary,
             page_context={"description": ""},
         )
-        
+
         # Store webpage_id in session for potential delete operation
         cl.user_session.set("last_webpage_id", webpage_id)
-        
+
         await cl.Message(
             content=f"✅ **Webpage saved successfully!**\n\n**Summary:** {summary}\n\n**ID:** {webpage_id}"
         ).send()
     except Exception as e:
-        await cl.Message(
-            content=f"❌ Error saving webpage: {str(e)}"
-        ).send()
+        await cl.Message(content=f"❌ Error saving webpage: {str(e)}").send()
 
 
 @cl.action_callback("delete")
@@ -410,16 +411,16 @@ async def handle_delete_webpage(action: cl.Action):
     """Handle deleting webpage from database."""
     try:
         webpage_id = cl.user_session.get("last_webpage_id")
-        
+
         if not webpage_id:
             await cl.Message(
                 content="❌ No webpage to delete. Save a webpage first using the 'add' button."
             ).send()
             return
-        
+
         await cl.Message(content="⏳ Deleting webpage...").send()
         success = await delete_webpage_from_db(webpage_id)
-        
+
         if success:
             cl.user_session.set("last_webpage_id", None)
             await cl.Message(
@@ -430,6 +431,4 @@ async def handle_delete_webpage(action: cl.Action):
                 content=f"❌ Webpage not found or already deleted (ID: {webpage_id})"
             ).send()
     except Exception as e:
-        await cl.Message(
-            content=f"❌ Error deleting webpage: {str(e)}"
-        ).send()
+        await cl.Message(content=f"❌ Error deleting webpage: {str(e)}").send()
