@@ -3,6 +3,7 @@ from urllib.parse import unquote, urlparse, parse_qs
 from contextvars import ContextVar
 import importlib
 import functools
+import math
 from fastapi import Body
 from chainlit.server import app as chainlit_app
 from pathlib import Path
@@ -141,6 +142,95 @@ async def generate_embeddings(text: str) -> list:
     except Exception as e:
         print(f"Error generating embedding: {e}")
         return [0.0] * 1536
+
+
+def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+
+    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+
+    return dot_product / (norm_a * norm_b)
+
+
+async def is_page_context_relevant(
+    question: str, page_text: str, threshold: float = 0.8
+) -> bool:
+    """Estimate whether the currently scraped page text is relevant to the query."""
+    if not page_text or len(page_text.strip()) < 200:
+        return False
+
+    # Compare question to a bounded page excerpt to keep retrieval latency stable.
+    page_excerpt = page_text[:4000]
+    question_embedding = await generate_embeddings(question)
+    page_embedding = await generate_embeddings(page_excerpt)
+    similarity = cosine_similarity(question_embedding, page_embedding)
+    print(f"Page relevance similarity: {similarity:.4f}")
+    return similarity >= threshold
+
+
+async def retrieve_relevant_chunks_from_db(
+    question: str, top_k: int = 4, max_distance: float = 0.60
+) -> list[dict]:
+    """Retrieve the most relevant chunks from pgvector for fallback context."""
+    session = get_db_session()
+    try:
+        question_embedding = await generate_embeddings(question)
+        distance_expr = Chunk.embedding.cosine_distance(question_embedding)
+
+        rows = (
+            session.query(
+                Chunk.content,
+                Chunk.chunk_index,
+                Webpage.title,
+                Webpage.url,
+                distance_expr.label("distance"),
+            )
+            .join(Webpage, Webpage.id == Chunk.webpage_id)
+            .order_by(distance_expr.asc())
+            .limit(top_k)
+            .all()
+        )
+
+        results = []
+        for row in rows:
+            distance = float(row.distance) if row.distance is not None else 1.0
+            if distance <= max_distance:
+                results.append(
+                    {
+                        "content": row.content,
+                        "chunk_index": row.chunk_index,
+                        "title": row.title or "Untitled",
+                        "url": row.url or "Unknown",
+                        "distance": distance,
+                    }
+                )
+
+        return results
+    except Exception as e:
+        print(f"Error retrieving chunks from database: {e}")
+        return []
+    finally:
+        session.close()
+
+
+def format_db_context(chunks: list[dict]) -> str:
+    """Format retrieved chunks into a compact context section for prompting."""
+    lines = []
+    for i, chunk in enumerate(chunks, start=1):
+        lines.append(
+            f"[DB Chunk {i}]\n"
+            f"Title: {chunk['title']}\n"
+            f"URL: {chunk['url']}\n"
+            f"Text: {chunk['content']}"
+        )
+    return "\n\n".join(lines)
 
 
 async def generate_summary(text: str, title: str, llm_chain) -> str:
@@ -351,12 +441,40 @@ async def on_message(message: cl.Message):
         ).send()
         return
 
+    # If the scraped page context is likely irrelevant for this question,
+    # fallback to semantic retrieval from the saved pgvector knowledge base.
+    effective_system_prompt = system_prompt
+    page_relevant = await is_page_context_relevant(message.content, page_text)
+    print(f"Page relevance check: {page_relevant}")
+    # exit()
+    if not page_relevant:
+        db_chunks = await retrieve_relevant_chunks_from_db(message.content, top_k=4)
+        if db_chunks:
+            db_context = format_db_context(db_chunks)
+            effective_system_prompt = (
+                f"{system_prompt}\n\n"
+                "--- RETRIEVED DATABASE CONTEXT START ---\n"
+                f"{db_context}\n"
+                "--- RETRIEVED DATABASE CONTEXT END ---\n\n"
+                "When answering, use the database context above as the primary source "
+                "for this question because current page content appears less relevant."
+            )
+
+            best_chunk = db_chunks[0]
+            await cl.Message(
+                content=(
+                    "ℹ️ Current page context seems less relevant for this question. "
+                    f"I retrieved related content from saved pages (best match: "
+                    f"{best_chunk['title']} | distance={best_chunk['distance']:.3f})."
+                )
+            ).send()
+
     # Generate response
     text = await llm_chain.ainvoke(
         {
             "input": message.content,
             "history": history_text,
-            "system_prompt": system_prompt,
+            "system_prompt": effective_system_prompt,
         }
     )
 
