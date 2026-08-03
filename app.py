@@ -105,6 +105,18 @@ def format_history(history: list) -> str:
     return "\n".join(lines)
 
 
+def parse_page_answer_flag(text: str) -> tuple[bool, str]:
+    """Read the page-answerability flag from the first line of the model output."""
+    normalized = (text or "").lstrip()
+    if normalized.startswith("ANSWERED_FROM_PAGE: yes"):
+        body = normalized.split("\n", 1)[1].strip() if "\n" in normalized else ""
+        return True, body
+    if normalized.startswith("ANSWERED_FROM_PAGE: no"):
+        body = normalized.split("\n", 1)[1].strip() if "\n" in normalized else ""
+        return False, body
+    return True, normalized.strip()
+
+
 async def send_message_actions(message_id: str) -> None:
     """Attach add/delete actions to an existing message."""
     actions = [
@@ -389,9 +401,16 @@ URL:   {page_url}
 
 Rules:
 - Answer ONLY from the page content above
-- If the content is not included in the page but relevant, you may answer from your general knowledge
+- Do not use general knowledge in the first pass
 - If something isn't covered, say so honestly
 - Be concise. Cite the page when helpful.
+- Start every response with exactly one flag line:
+    ANSWERED_FROM_PAGE: yes
+    ANSWERED_FROM_PAGE: no
+- Use ANSWERED_FROM_PAGE: yes only when the answer is supported by the page content above.
+- Use ANSWERED_FROM_PAGE: no when the page content does not contain enough information to answer the query.
+- After the flag line, provide the answer body only.
+
 """
 
     cl.user_session.set("system_prompt", system_prompt)
@@ -424,9 +443,6 @@ async def on_message(message: cl.Message):
     """Process user message and generate response."""
     system_prompt = cl.user_session.get("system_prompt", "")
     history = cl.user_session.get("history", [])
-    page_url = cl.user_session.get("page_url", "Unknown")
-    page_title = cl.user_session.get("page_title", "Unknown")
-    page_text = cl.user_session.get("page_text", "")
 
     # Add user message to history
     history.append({"role": "user", "content": message.content})
@@ -441,13 +457,16 @@ async def on_message(message: cl.Message):
         ).send()
         return
 
-    # If the scraped page context is likely irrelevant for this question,
-    # fallback to semantic retrieval from the saved pgvector knowledge base.
-    effective_system_prompt = system_prompt
-    page_relevant = await is_page_context_relevant(message.content, page_text)
-    print(f"Page relevance check: {page_relevant}")
-    # exit()
-    if not page_relevant:
+    first_pass_text = await llm_chain.ainvoke(
+        {
+            "input": message.content,
+            "history": history_text,
+            "system_prompt": system_prompt,
+        }
+    )
+    answered_from_page, text = parse_page_answer_flag(first_pass_text)
+
+    if not answered_from_page:
         db_chunks = await retrieve_relevant_chunks_from_db(message.content, top_k=4)
         if db_chunks:
             db_context = format_db_context(db_chunks)
@@ -456,27 +475,36 @@ async def on_message(message: cl.Message):
                 "--- RETRIEVED DATABASE CONTEXT START ---\n"
                 f"{db_context}\n"
                 "--- RETRIEVED DATABASE CONTEXT END ---\n\n"
-                "When answering, use the database context above as the primary source "
-                "for this question because current page content appears less relevant."
+                "The first-pass flag showed that the current page does not answer the "
+                "query. Use the retrieved database context above as the primary source. "
+                "If the database context answers the question, start your response with "
+                "ANSWERED_FROM_PAGE: no and then provide the answer body. If it still "
+                "does not answer the question, start your response with ANSWERED_FROM_PAGE: no "
+                "and state that neither the page nor saved knowledge contains the answer."
             )
 
             best_chunk = db_chunks[0]
             await cl.Message(
                 content=(
-                    "ℹ️ Current page context seems less relevant for this question. "
+                    "ℹ️ The page content does not answer this question. "
                     f"I retrieved related content from saved pages (best match: "
                     f"{best_chunk['title']} | distance={best_chunk['distance']:.3f})."
                 )
             ).send()
 
-    # Generate response
-    text = await llm_chain.ainvoke(
-        {
-            "input": message.content,
-            "history": history_text,
-            "system_prompt": effective_system_prompt,
-        }
-    )
+            second_pass_text = await llm_chain.ainvoke(
+                {
+                    "input": message.content,
+                    "history": history_text,
+                    "system_prompt": effective_system_prompt,
+                }
+            )
+            _, text = parse_page_answer_flag(second_pass_text)
+        else:
+            text = (
+                text
+                or "The current page does not contain enough information, and no relevant saved knowledge was found in the database."
+            )
 
     # Add assistant response to history
     history.append({"role": "assistant", "content": text})
