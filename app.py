@@ -59,6 +59,10 @@ LAST_PAGE_CONTEXT = {
     "page_text": "",
 }
 
+SUMMARY_TRIGGER_TURNS = 18
+SUMMARY_TRIGGER_TOKENS = 5000
+RECENT_TURNS_TO_KEEP = 8
+
 
 def read_query_param(params, key, default=""):
     """Extract and decode query parameter, handling list/str formats."""
@@ -103,6 +107,75 @@ def format_history(history: list) -> str:
         if content:
             lines.append(f"{role}: {content}")
     return "\n".join(lines)
+
+
+def estimate_tokens(text: str) -> int:
+    """Approximate token count using a fast character-based heuristic."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def format_history_with_summary(history: list, summary: str) -> str:
+    """Build the model history block using long-term summary plus recent turns."""
+    recent_history = format_history(history)
+    if summary:
+        return (
+            "Conversation summary (older turns):\n"
+            f"{summary}\n\n"
+            "Recent conversation turns:\n"
+            f"{recent_history}"
+        )
+    return recent_history
+
+
+async def summarize_history(old_turns: list, existing_summary: str = "") -> str:
+    """Summarize old conversation turns into compact memory text."""
+    transcript = format_history(old_turns)
+    if not transcript:
+        return existing_summary
+
+    summary_prompt = f"""
+You are maintaining compact long-term memory for an assistant conversation.
+
+Current memory summary:
+{existing_summary or "(none)"}
+
+Older conversation turns to compress:
+{transcript}
+
+Write an updated memory summary that keeps durable facts, user preferences, decisions,
+open tasks, and constraints. Keep it concise and factual. Use plain text.
+"""
+
+    summary_llm = ChatOllama(model="chatside-qwen3")
+    try:
+        result = await summary_llm.ainvoke(summary_prompt)
+        content = getattr(result, "content", result)
+        if isinstance(content, list):
+            content = "\n".join(str(item) for item in content)
+        return str(content).strip() or existing_summary
+    except Exception as e:
+        print(f"Error summarizing history: {e}")
+        return existing_summary
+
+
+async def maybe_rollup_history(history: list, existing_summary: str) -> tuple[list, str, bool]:
+    """Summarize older turns when history grows past context thresholds."""
+    history_text = format_history(history)
+    exceeds_turn_limit = len(history) > SUMMARY_TRIGGER_TURNS
+    exceeds_token_limit = estimate_tokens(history_text) > SUMMARY_TRIGGER_TOKENS
+
+    if not (exceeds_turn_limit or exceeds_token_limit):
+        return history, existing_summary, False
+
+    if len(history) <= RECENT_TURNS_TO_KEEP:
+        return history, existing_summary, False
+
+    old_turns = history[:-RECENT_TURNS_TO_KEEP]
+    recent_turns = history[-RECENT_TURNS_TO_KEEP:]
+    updated_summary = await summarize_history(old_turns, existing_summary)
+    return recent_turns, updated_summary, True
 
 
 def parse_page_answer_flag(text: str) -> tuple[bool, str]:
@@ -414,6 +487,7 @@ Rules:
 """
 
     cl.user_session.set("system_prompt", system_prompt)
+    cl.user_session.set("history_summary", "")
 
     # Initialize Ollama LLM with prompt template and chain
     llm = ChatOllama(model="chatside-qwen3")
@@ -443,11 +517,19 @@ async def on_message(message: cl.Message):
     """Process user message and generate response."""
     system_prompt = cl.user_session.get("system_prompt", "")
     history = cl.user_session.get("history", [])
+    history_summary = cl.user_session.get("history_summary", "")
 
     # Add user message to history
     history.append({"role": "user", "content": message.content})
-    history_text = format_history(history)
+    history, history_summary, did_rollup = await maybe_rollup_history(
+        history, history_summary
+    )
+    if did_rollup:
+        print("History rollup completed: older turns summarized into memory.")
+
+    history_text = format_history_with_summary(history, history_summary)
     cl.user_session.set("history", history)
+    cl.user_session.set("history_summary", history_summary)
 
     # Get LLM chain
     llm_chain = cl.user_session.get("llm_chain")
@@ -508,7 +590,14 @@ async def on_message(message: cl.Message):
 
     # Add assistant response to history
     history.append({"role": "assistant", "content": text})
+    history, history_summary, did_rollup = await maybe_rollup_history(
+        history, history_summary
+    )
+    if did_rollup:
+        print("History rollup completed after assistant response.")
+
     cl.user_session.set("history", history)
+    cl.user_session.set("history_summary", history_summary)
 
     response_message = await cl.Message(content=text).send()
     await send_message_actions(response_message.id)
