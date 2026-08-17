@@ -8,7 +8,7 @@ from fastapi import Body
 from chainlit.server import app as chainlit_app
 from pathlib import Path
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -16,6 +16,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 from chainlit.action import Action as ChainlitAction
+from typing import Optional
 
 from models import Webpage, Chunk, get_db_session
 
@@ -63,6 +64,9 @@ SUMMARY_TRIGGER_TURNS = 18
 SUMMARY_TRIGGER_TOKENS = 5000
 RECENT_TURNS_TO_KEEP = 8
 
+MODEL_EMBEDDING_DIM = 1024  # mxbai-embed-large native dimension
+DB_EMBEDDING_DIM = 1536  # Must match Chunk.embedding Vector(1536)
+
 
 def read_query_param(params, key, default=""):
     """Extract and decode query parameter, handling list/str formats."""
@@ -99,9 +103,9 @@ def normalize_page_url(value: str) -> str:
 
 
 def format_history(history: list) -> str:
-    """Format last 12 turns of conversation history."""
+    """Format turns of conversation history."""
     lines = []
-    for turn in history[-12:]:
+    for turn in history:
         role = str(turn.get("role", "user"))
         content = str(turn.get("content", "")).strip()
         if content:
@@ -203,30 +207,55 @@ async def send_message_actions(message_id: str) -> None:
 
 
 async def chunk_content(
-    text: str, chunk_size: int = 800, overlap: int = 100
+    text: str, chunk_size: int = 512, overlap: int = 64
 ) -> list[dict]:
-    """Split content into chunks using LangChain with token-based splitting."""
-    splitter = RecursiveCharacterTextSplitter(
+    """Split content into token-based chunks for RAG retrieval."""
+    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        model_name="gpt2",
         chunk_size=chunk_size,
         chunk_overlap=overlap,
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_text(text)
-    return [{"content": chunk, "index": i} for i, chunk in enumerate(chunks)]
+    return [
+        {
+            "content": chunk,
+            "index": i,
+            "total_chunks": len(chunks),
+            "char_length": len(chunk),
+            "is_first": i == 0,
+            "is_last": i == len(chunks) - 1,
+        }
+        for i, chunk in enumerate(chunks)
+    ]
 
 
-async def generate_embeddings(text: str) -> list:
-    """Generate embeddings using Ollama embedding model compatible with qwen3."""
+
+async def generate_embeddings(
+    text: str, embeddings_model: OllamaEmbeddings
+) -> Optional[list[float]]:
+    """Generate embeddings normalized to DB dimension requirements."""
     try:
-        embeddings_model = OllamaEmbeddings(model="mxbai-embed-large")
         embedding = await embeddings_model.aembed_query(text)
-        # Pad to 1536 if necessary (mxbai-embed-large produces 1024)
-        if len(embedding) < 1536:
-            embedding = embedding + [0.0] * (1536 - len(embedding))
-        return embedding[:1536]
+
+        # Validate expected native model dimension.
+        if len(embedding) != MODEL_EMBEDDING_DIM:
+            raise ValueError(
+                f"Unexpected embedding dimension: {len(embedding)}, "
+                f"expected {MODEL_EMBEDDING_DIM}"
+            )
+
+        # Match pgvector schema dimension exactly.
+        if len(embedding) < DB_EMBEDDING_DIM:
+            embedding = embedding + [0.0] * (DB_EMBEDDING_DIM - len(embedding))
+        elif len(embedding) > DB_EMBEDDING_DIM:
+            embedding = embedding[:DB_EMBEDDING_DIM]
+
+        return embedding
+
     except Exception as e:
         print(f"Error generating embedding: {e}")
-        return [0.0] * 1536
+        return None  # Return None so caller can handle failure explicitly
 
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
@@ -245,7 +274,10 @@ def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 
 
 async def is_page_context_relevant(
-    question: str, page_text: str, threshold: float = 0.8
+    question: str,
+    page_text: str,
+    embeddings_model: OllamaEmbeddings,
+    threshold: float = 0.8,
 ) -> bool:
     """Estimate whether the currently scraped page text is relevant to the query."""
     if not page_text or len(page_text.strip()) < 200:
@@ -253,20 +285,27 @@ async def is_page_context_relevant(
 
     # Compare question to a bounded page excerpt to keep retrieval latency stable.
     page_excerpt = page_text[:4000]
-    question_embedding = await generate_embeddings(question)
-    page_embedding = await generate_embeddings(page_excerpt)
+    question_embedding = await generate_embeddings(question, embeddings_model)
+    page_embedding = await generate_embeddings(page_excerpt, embeddings_model)
+    if question_embedding is None or page_embedding is None:
+        return False
     similarity = cosine_similarity(question_embedding, page_embedding)
     print(f"Page relevance similarity: {similarity:.4f}")
     return similarity >= threshold
 
 
 async def retrieve_relevant_chunks_from_db(
-    question: str, top_k: int = 4, max_distance: float = 0.60
+    question: str,
+    embeddings_model: OllamaEmbeddings,
+    top_k: int = 4,
+    max_distance: float = 0.60,
 ) -> list[dict]:
     """Retrieve the most relevant chunks from pgvector for fallback context."""
     session = get_db_session()
     try:
-        question_embedding = await generate_embeddings(question)
+        question_embedding = await generate_embeddings(question, embeddings_model)
+        if question_embedding is None:
+            return []
         distance_expr = Chunk.embedding.cosine_distance(question_embedding)
 
         rows = (
@@ -321,17 +360,21 @@ def format_db_context(chunks: list[dict]) -> str:
 async def generate_summary(text: str, title: str, llm_chain) -> str:
     """Generate summary of webpage content using the LLM."""
     try:
-        summary_prompt = f"""Summarize the following webpage content in 2-3 sentences.
+
+        summary_prompt = f"""/no_think
+Summarize the following webpage content in 2-3 sentences.
 Title: {title}
 Content:
-{text[:2000]}...
+{text[:20000]}...
 
 Summary:"""
         summary = await llm_chain.ainvoke(
             {
                 "input": summary_prompt,
                 "history": "",
-                "system_prompt": "You are a helpful summarizer. Provide concise summaries.",
+                "system_prompt": "You are a webpage summarizer. Return exactly 2-3 sentences. \
+                    Focus on the main topic, key points, and purpose of the page. \
+                        No preamble, no bullet points, just plain sentences.",
             }
         )
         return summary.strip()
@@ -341,7 +384,12 @@ Summary:"""
 
 
 async def save_webpage_to_db(
-    url: str, title: str, content: str, summary: str, page_context: dict
+    url: str,
+    title: str,
+    content: str,
+    summary: str,
+    page_context: dict,
+    embeddings_model: OllamaEmbeddings,
 ) -> str:
     """Save webpage and chunks to database with embeddings."""
     session = get_db_session()
@@ -365,18 +413,22 @@ async def save_webpage_to_db(
         webpage.llm_summary = summary
         webpage.word_count = len(content.split())
         webpage.status = "processed"
-        webpage.last_visited_at = datetime.utcnow()
+        webpage.last_visited_at = datetime.now(timezone.utc)
 
         session.query(Chunk).filter(Chunk.webpage_id == webpage.id).delete(
             synchronize_session=False
         )
 
         # Generate chunks
-        chunks_data = await chunk_content(content, chunk_size=800, overlap=100)
+        chunks_data = await chunk_content(content, chunk_size=512, overlap=64)
 
         # Create chunk records with embeddings
         for chunk_info in chunks_data:
-            embedding = await generate_embeddings(chunk_info["content"])
+            embedding = await generate_embeddings(
+                chunk_info["content"], embeddings_model
+            )
+            if embedding is None:
+                continue
             chunk = Chunk(
                 webpage_id=webpage.id,
                 chunk_index=chunk_info["index"],
@@ -491,6 +543,7 @@ Rules:
 
     # Initialize Ollama LLM with prompt template and chain
     llm = ChatOllama(model="chatside-qwen3")
+    embeddings_model = OllamaEmbeddings(model="mxbai-embed-large")
     prompt = ChatPromptTemplate.from_template(
         """{system_prompt}
 
@@ -503,9 +556,12 @@ User question:
 
     chain = prompt | llm | StrOutputParser()
     cl.user_session.set("llm_chain", chain)
+    cl.user_session.set("embeddings_model", embeddings_model)
 
     print("Chat session initialized successfully.")
 
+
+    # From a single user's perspective, async/await behaves exactly like normal sequential code.
     welcome_message = await cl.Message(
         content=f"✅ **{page_title}** loaded!\n\nAsk me anything about this page."
     ).send()
@@ -519,23 +575,19 @@ async def on_message(message: cl.Message):
     history = cl.user_session.get("history", [])
     history_summary = cl.user_session.get("history_summary", "")
 
-    # Add user message to history
-    history.append({"role": "user", "content": message.content})
-    history, history_summary, did_rollup = await maybe_rollup_history(
-        history, history_summary
-    )
-    if did_rollup:
-        print("History rollup completed: older turns summarized into memory.")
-
     history_text = format_history_with_summary(history, history_summary)
-    cl.user_session.set("history", history)
-    cl.user_session.set("history_summary", history_summary)
 
     # Get LLM chain
     llm_chain = cl.user_session.get("llm_chain")
+    embeddings_model = cl.user_session.get("embeddings_model")
     if not llm_chain:
         await cl.Message(
             content="Model is not initialized. Start a new chat session."
+        ).send()
+        return
+    if not embeddings_model:
+        await cl.Message(
+            content="Embedding model is not initialized. Start a new chat session."
         ).send()
         return
 
@@ -549,7 +601,9 @@ async def on_message(message: cl.Message):
     answered_from_page, text = parse_page_answer_flag(first_pass_text)
 
     if not answered_from_page:
-        db_chunks = await retrieve_relevant_chunks_from_db(message.content, top_k=4)
+        db_chunks = await retrieve_relevant_chunks_from_db(
+            message.content, embeddings_model, top_k=4
+        )
         if db_chunks:
             db_context = format_db_context(db_chunks)
             effective_system_prompt = (
@@ -588,6 +642,8 @@ async def on_message(message: cl.Message):
                 or "The current page does not contain enough information, and no relevant saved knowledge was found in the database."
             )
 
+    # Add user message to history
+    history.append({"role": "user", "content": message.content})
     # Add assistant response to history
     history.append({"role": "assistant", "content": text})
     history, history_summary, did_rollup = await maybe_rollup_history(
@@ -611,9 +667,15 @@ async def handle_add_webpage(action: cl.Action):
         page_title = cl.user_session.get("page_title", "Unknown")
         page_text = cl.user_session.get("page_text", "")
         llm_chain = cl.user_session.get("llm_chain")
+        embeddings_model = cl.user_session.get("embeddings_model")
 
         if not page_text:
             await cl.Message(content="❌ No page content available to save.").send()
+            return
+        if not embeddings_model:
+            await cl.Message(
+                content="❌ Embedding model is not initialized. Start a new chat session."
+            ).send()
             return
 
         # Show progress
@@ -629,6 +691,7 @@ async def handle_add_webpage(action: cl.Action):
             content=page_text,
             summary=summary,
             page_context={"description": ""},
+            embeddings_model=embeddings_model,
         )
 
         # Store webpage_id in session for potential delete operation
