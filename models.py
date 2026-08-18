@@ -49,7 +49,7 @@ class Chunk(Base):
     webpage_id = Column(Uuid, ForeignKey("webpages.id", ondelete="CASCADE"), nullable=False)
     chunk_index = Column(Integer, nullable=False)  # order of chunk in document
     content = Column(Text, nullable=False)  # actual chunk text
-    embedding = Column(Vector(1536))  # OpenAI ada-002 = 1536, 3-small = 1536, 3-large = 3072, Llama = 4096
+    embedding = Column(Vector(1024))  
     token_count = Column(Integer)  # token count of chunk
     chunk_type = Column(String, default='summary')  # summary, raw, heading
     created_at = Column(DateTime(timezone=True), default=func.now())

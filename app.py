@@ -65,7 +65,6 @@ SUMMARY_TRIGGER_TOKENS = 5000
 RECENT_TURNS_TO_KEEP = 8
 
 MODEL_EMBEDDING_DIM = 1024  # mxbai-embed-large native dimension
-DB_EMBEDDING_DIM = 1536  # Must match Chunk.embedding Vector(1536)
 
 
 def read_query_param(params, key, default=""):
@@ -244,12 +243,6 @@ async def generate_embeddings(
                 f"Unexpected embedding dimension: {len(embedding)}, "
                 f"expected {MODEL_EMBEDDING_DIM}"
             )
-
-        # Match pgvector schema dimension exactly.
-        if len(embedding) < DB_EMBEDDING_DIM:
-            embedding = embedding + [0.0] * (DB_EMBEDDING_DIM - len(embedding))
-        elif len(embedding) > DB_EMBEDDING_DIM:
-            embedding = embedding[:DB_EMBEDDING_DIM]
 
         return embedding
 
