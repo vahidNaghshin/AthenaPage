@@ -93,7 +93,7 @@ ollama serve
 
 # Terminal 3: Run Chainlit
 source .venv/bin/activate
-export DATABASE_URL=postgresql://postgres:postgres@localhost/page_embeddings
+export APP_DATABASE_URL=postgresql://postgres:postgres@localhost/page_embeddings
 python models.py            # create tables on first run
 python -u -m chainlit run app.py -h
 ```
@@ -191,7 +191,7 @@ Browser Extension        Chainlit Backend            PostgreSQL / Ollama
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://postgres:postgres@localhost/page_embeddings` | SQLAlchemy-compatible Postgres URL |
+| `APP_DATABASE_URL` | `postgresql://postgres:postgres@localhost/page_embeddings` | SQLAlchemy-compatible Postgres URL for this app's own tables (`webpages`, `chunks`). Deliberately not named `DATABASE_URL` — Chainlit auto-enables its own Postgres persistence layer when that variable is set, which requires separate Chainlit-managed tables. |
 
 The app also loads `.env` from the project root and app directory if present.
 

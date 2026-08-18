@@ -42,7 +42,7 @@ fi
 
 psql -d page_embeddings -c "ALTER DATABASE page_embeddings OWNER TO postgres;" >/dev/null
 PGPASSWORD=postgres psql -U postgres -h localhost -d page_embeddings -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
-DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost/page_embeddings}" \
+APP_DATABASE_URL="${APP_DATABASE_URL:-postgresql://postgres:postgres@localhost/page_embeddings}" \
     python models.py >/dev/null
 
 echo -e "${GREEN}✓ PostgreSQL setup complete${NC}"
@@ -70,6 +70,12 @@ ollama pull mxbai-embed-large 2>/dev/null || true
 echo -e "${GREEN}✓ Ollama setup complete${NC}"
 echo -e "${YELLOW}Starting Chainlit app...${NC}"
 
-# Start Chainlit with unbuffered output
-DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost/page_embeddings}" \
+# Start Chainlit with unbuffered output.
+# Intentionally NOT setting DATABASE_URL here: Chainlit auto-enables its own
+# Postgres-backed persistence layer (threads/steps/users tables) whenever
+# DATABASE_URL is present in the environment. This app manages its own
+# persistence (webpages/chunks) via APP_DATABASE_URL instead.
+# Unset DATABASE_URL in case it leaked in from the calling shell's environment.
+unset DATABASE_URL
+APP_DATABASE_URL="${APP_DATABASE_URL:-postgresql://postgres:postgres@localhost/page_embeddings}" \
     python -u -m chainlit run app.py -h

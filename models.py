@@ -8,13 +8,15 @@ from pgvector.sqlalchemy import Vector
 Base = declarative_base()
 
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost/page_embeddings"
+# Uses a distinct env var name (not DATABASE_URL) so Chainlit does not
+# auto-detect it and enable its own Postgres-backed persistence layer.
+APP_DATABASE_URL = os.getenv(
+    "APP_DATABASE_URL", "postgresql://postgres:postgres@localhost/page_embeddings"
 )
 
 
 def get_engine():
-    return create_engine(DATABASE_URL)
+    return create_engine(APP_DATABASE_URL)
 
 
 class Webpage(Base):
